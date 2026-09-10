@@ -21,6 +21,11 @@ from metaworld.env_dict import (
     ALL_V3_ENVIRONMENTS_GOAL_HIDDEN,
     ALL_V3_ENVIRONMENTS_GOAL_OBSERVABLE,
 )
+from metaworld.multi_objective import (
+    MORecordEpisodeStatistics,
+    MultiObjectiveReward,
+    mt_vectorizer,
+)
 from metaworld.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 from metaworld.types import Task  # type: ignore
 from metaworld.wrappers import (
@@ -411,12 +416,21 @@ def _init_each_env(
     reward_normalization_method: Literal["gymnasium", "exponential"] | None = None,
     normalize_observations: bool = False,
     reward_alpha: float = 0.001,
+    multi_objective: bool = False,
+    effort_weight: float = 1.0,
     render_mode: Literal["human", "rgb_array", "depth_array"] | None = None,
     camera_name: str | None = None,
     camera_id: int | None = None,
     width: int = 480,
     height: int = 480,
 ) -> gym.Env:
+    if multi_objective and (recurrent_info_in_obs or reward_normalization_method):
+        raise ValueError(
+            "Multi-objective rewards do not support scalar reward normalization "
+            "or recurrent_info_in_obs; normalize/scalarize explicitly in the learner"
+        )
+    if multi_objective and (not np.isfinite(effort_weight) or effort_weight <= 0):
+        raise ValueError("effort_weight must be finite and strictly positive")
     env: gym.Env = env_cls(
         reward_function_version=reward_function_version,
         render_mode=render_mode,
@@ -425,9 +439,11 @@ def _init_each_env(
         width=width,
         height=height,
     )
+    if multi_objective:
+        env = MultiObjectiveReward(env, effort_weight=effort_weight)
     if seed is not None:
-        env.seed(seed)  # type: ignore
-    env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)  # type: ignore
+        env.unwrapped.seed(seed)  # type: ignore
+    env = gym.wrappers.TimeLimit(env, max_episode_steps or env.unwrapped.max_path_length)  # type: ignore
     env = AutoTerminateOnSuccessWrapper(env)
     env.toggle_terminate_on_success(terminate_on_success)
     if use_one_hot:
@@ -444,7 +460,11 @@ def _init_each_env(
         env = NormalizeRewardsExponential(reward_alpha=reward_alpha, env=env)
     if normalize_observations:
         env = gym.wrappers.NormalizeObservation(env)
-    env = gym.wrappers.RecordEpisodeStatistics(env)
+    env = (
+        MORecordEpisodeStatistics
+        if multi_objective
+        else gym.wrappers.RecordEpisodeStatistics
+    )(env)
 
     if task_select != "random":
         env = PseudoRandomTaskSelectWrapper(env, tasks)
@@ -465,6 +485,7 @@ def make_mt_envs(
     autoreset_mode: gym.vector.AutoresetMode | str = gym.vector.AutoresetMode.SAME_STEP,
     **kwargs,
 ) -> gym.Env | gym.vector.VectorEnv:
+    vectorizer = mt_vectorizer(vector_strategy, kwargs.get("multi_objective", False))
     benchmark: Benchmark
     if name in ALL_V3_ENVIRONMENTS.keys():
         benchmark = MT1(name, seed=seed)
@@ -478,9 +499,7 @@ def make_mt_envs(
         )
     elif name == "MT10" or name == "MT25" or name == "MT50":
         benchmark = globals()[name](seed=seed)
-        vectorizer: type[gym.vector.VectorEnv] = getattr(
-            gym.vector, f"{vector_strategy.capitalize()}VectorEnv"
-        )
+
         if name == "MT10":
             default_num_tasks = 10
         elif name == "MT25":
@@ -544,8 +563,8 @@ def _make_ml_envs_inner(
             ), f"Invalid division of subtasks, expected {len(tasks) // tasks_per_env} got {len(tasks_for_subenv)}"
             env_tuples.append((env_cls, tasks_for_subenv))
 
-    vectorizer: type[gym.vector.SyncVectorEnv | gym.vector.AsyncVectorEnv] = getattr(
-        gym.vector, f"{vector_strategy.capitalize()}VectorEnv"
+    vectorizer: type[gym.vector.SyncVectorEnv | gym.vector.AsyncVectorEnv] = (
+        mt_vectorizer(vector_strategy, kwargs.get("multi_objective", False))
     )
     return vectorizer(
         [
@@ -608,8 +627,9 @@ def register_mw_envs() -> None:
     def _mt_bench_vector_entry_point(
         mt_bench: str,
         vector_strategy: Literal["sync", "async"],
-        autoreset_mode: gym.vector.AutoresetMode
-        | str = gym.vector.AutoresetMode.SAME_STEP,
+        autoreset_mode: (
+            gym.vector.AutoresetMode | str
+        ) = gym.vector.AutoresetMode.SAME_STEP,
         seed=None,
         use_one_hot=False,
         num_envs=None,
@@ -632,8 +652,9 @@ def register_mw_envs() -> None:
         ml_bench: str,
         split: Literal["train", "test"],
         vector_strategy: Literal["sync", "async"],
-        autoreset_mode: gym.vector.AutoresetMode
-        | str = gym.vector.AutoresetMode.SAME_STEP,
+        autoreset_mode: (
+            gym.vector.AutoresetMode | str
+        ) = gym.vector.AutoresetMode.SAME_STEP,
         total_tasks_per_cls: int | None = None,
         seed: int | None = None,
         meta_batch_size: int = 20,
@@ -696,9 +717,11 @@ def register_mw_envs() -> None:
     register(
         id="Meta-World/goal_observable",
         entry_point=lambda env_name, seed: ALL_V3_ENVIRONMENTS_GOAL_OBSERVABLE[
-            env_name + "-goal-observable"
-            if "-goal-observable" not in env_name
-            else env_name
+            (
+                env_name + "-goal-observable"
+                if "-goal-observable" not in env_name
+                else env_name
+            )
         ](  # type: ignore
             seed=seed
         ),
@@ -742,14 +765,15 @@ def register_mw_envs() -> None:
         vector_strategy: str,
         envs_list: list[str],
         seed=None,
-        autoreset_mode: gym.vector.AutoresetMode
-        | str = gym.vector.AutoresetMode.SAME_STEP,
+        autoreset_mode: (
+            gym.vector.AutoresetMode | str
+        ) = gym.vector.AutoresetMode.SAME_STEP,
         use_one_hot: bool = False,
         num_envs=None,
         **lamb_kwargs,
     ):
-        vectorizer: type[gym.vector.VectorEnv] = getattr(
-            gym.vector, f"{vector_strategy.capitalize()}VectorEnv"
+        vectorizer: type[gym.vector.VectorEnv] = mt_vectorizer(
+            vector_strategy, lamb_kwargs.get("multi_objective", False)
         )
         return vectorizer(  # type: ignore
             [
@@ -785,8 +809,9 @@ def register_mw_envs() -> None:
         vector_strategy: str,
         train_envs: list[str],
         test_envs: list[str],
-        autoreset_mode: gym.vector.AutoresetMode
-        | str = gym.vector.AutoresetMode.SAME_STEP,
+        autoreset_mode: (
+            gym.vector.AutoresetMode | str
+        ) = gym.vector.AutoresetMode.SAME_STEP,
         total_tasks_per_cls: int | None = None,
         meta_batch_size: int = 20,
         seed=None,

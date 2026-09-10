@@ -1,3 +1,49 @@
+# Meta-World — Adapted for Multi-Objective Reinforcement Learning (MORL)
+
+## MORL extension (added in this fork)
+
+This fork adds an effort objective to Meta-World's multi-task benchmarks. Install
+this checkout with `uv sync` or `pip install -e .` to use the extension.
+
+With `multi_objective=True`, both objectives are maximized:
+
+$$r_t = [r_{\mathrm{task},t},\; -c\|a_t\|_2^2].$$
+
+The task reward is unchanged. Effort follows
+[MO-Gymnasium's squared-action convention](https://github.com/Farama-Foundation/MO-Gymnasium/blob/main/mo_gymnasium/envs/mujoco/half_cheetah_v5.py),
+using all four commands (XYZ and gripper). It measures commanded effort, not
+physical energy. `effort_weight=c` defaults to `1.0` and must be finite and positive.
+
+```python
+import metaworld
+
+envs = metaworld.make_mt_envs(
+    "MT10",  # also MT25 or MT50
+    multi_objective=True,
+    effort_weight=1.0,
+    use_one_hot=True,
+    seed=42,
+)
+try:
+    obs, infos = envs.reset(seed=42)
+    obs, rewards, terminated, truncated, infos = envs.step(
+        envs.action_space.sample()
+    )  # rewards: (10, 2), or (50, 2) for MT50
+finally:
+    envs.close()
+```
+
+MORL currently supports synchronous vectorization only. Episode returns retain
+both objectives; with default autoreset, terminal statistics appear under
+`infos["final_info"]["episode"]["r"]`. Scalar reward normalization and
+`recurrent_info_in_obs` are unsupported in MORL mode. For fair comparisons, fix
+the horizon, seeds, effort weight, and preference set, and report results per task.
+Calls without `multi_objective=True` retain the original scalar rewards.
+
+---
+
+**Original Meta-World README**
+
 [![Python](https://img.shields.io/pypi/pyversions/metaworld.svg)](https://badge.fury.io/py/metaworld)
 [![PyPI](https://badge.fury.io/py/metaworld.svg)](https://badge.fury.io/py/metaworld.svg)
 [![arXiv](https://img.shields.io/badge/arXiv-2505.11289-b31b1b.svg)](https://arxiv.org/pdf/2505.11289)
